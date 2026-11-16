@@ -1,0 +1,330 @@
+// UNIMATE database schema
+// Postgres + Prisma. NextAuth (v4) adapter models are included for OAuth support.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum DocumentStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  TRUE_FALSE
+  SHORT_ANSWER
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  ABANDONED
+}
+
+enum PlanItemStatus {
+  PENDING
+  DONE
+  SKIPPED
+}
+
+// ───────────────────────────── Users & Auth ─────────────────────────────
+
+model User {
+  id            String        @id @default(cuid())
+  name          String?
+  /// "1 user = 1 account": e-mail is globally unique (stored lower-cased).
+  email         String        @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  role          Role          @default(USER)
+  status        AccountStatus @default(ACTIVE)
+  locale        String        @default("vi")
+  timezone      String        @default("Asia/Ho_Chi_Minh")
+
+  /// Single-active-session enforcement: only the LoginSession whose id matches is valid.
+  activeSessionId String?   @unique
+  loginCount      Int       @default(0)
+  lastLoginAt     DateTime?
+  lastSeenAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  loginSessions LoginSession[]
+  documents     Document[]
+  quizzes       Quiz[]
+  attempts      QuizAttempt[]
+  streak        Streak?
+  activities    StudyActivity[]
+  learningPlans LearningPlan[]
+  following     Follow[]        @relation("UserFollowing")
+  followers     Follow[]        @relation("UserFollowers")
+
+  @@index([lastSeenAt])
+  @@index([role, status])
+}
+
+/// OAuth accounts (NextAuth adapter). One provider account per user per provider.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@unique([userId, provider])
+}
+
+/// NextAuth adapter session table (unused with the JWT strategy, kept for adapter compatibility).
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+/// Audit trail of every login — powers the admin "who is online" view.
+model LoginSession {
+  id         String    @id @default(cuid())
+  userId     String
+  provider   String    @default("credentials")
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  endedAt    DateTime?
+  /// SIGNED_OUT | REPLACED_BY_NEW_LOGIN | FORCED_BY_ADMIN | SUSPENDED
+  endReason  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, endedAt])
+  @@index([createdAt])
+}
+
+// ───────────────────────────── Learning content ─────────────────────────────
+
+model Document {
+  id        String         @id @default(cuid())
+  userId    String
+  fileName  String
+  mimeType  String
+  sizeBytes Int
+  charCount Int
+  title     String?
+  /// Extracted plain text used as AI context.
+  content   String         @db.Text
+  summary   String?        @db.Text
+  keyPoints String[]
+  topics    String[]
+  language  String?
+  estimatedStudyMinutes Int?
+  status    DocumentStatus @default(PROCESSING)
+  error     String?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quizzes Quiz[]
+
+  @@index([userId, createdAt])
+}
+
+model Quiz {
+  id         String     @id @default(cuid())
+  userId     String
+  documentId String?
+  title      String
+  difficulty Difficulty @default(MEDIUM)
+  createdAt  DateTime   @default(now())
+
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document  Document?     @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  questions Question[]
+  attempts  QuizAttempt[]
+
+  @@index([userId, createdAt])
+  @@index([documentId])
+}
+
+model Question {
+  id            String       @id @default(cuid())
+  quizId        String
+  order         Int
+  type          QuestionType
+  prompt        String       @db.Text
+  /// MULTIPLE_CHOICE: answer texts. TRUE_FALSE: ["true","false"]. SHORT_ANSWER: [].
+  options       String[]
+  correctAnswer String       @db.Text
+  explanation   String       @db.Text
+  topic         String       @default("General")
+  difficulty    Difficulty   @default(MEDIUM)
+  points        Int          @default(1)
+
+  quiz    Quiz            @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  answers AttemptAnswer[]
+
+  @@unique([quizId, order])
+}
+
+model QuizAttempt {
+  id              String        @id @default(cuid())
+  quizId          String
+  userId          String
+  status          AttemptStatus @default(IN_PROGRESS)
+  startedAt       DateTime      @default(now())
+  submittedAt     DateTime?
+  score           Float?
+  maxScore        Float?
+  percent         Float?
+  /// Number of Focus Mode violations (tab switch, blur, fullscreen exit, navigation).
+  focusViolations Int           @default(0)
+  timeSpentSec    Int?
+  /// { overallFeedback, strengths[], weakTopics[], recommendations[] }
+  aiFeedback      Json?
+
+  quiz    Quiz            @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  answers AttemptAnswer[]
+
+  @@index([userId, status, submittedAt])
+  @@index([quizId])
+}
+
+model AttemptAnswer {
+  id            String   @id @default(cuid())
+  attemptId     String
+  questionId    String
+  response      String   @db.Text
+  isCorrect     Boolean
+  pointsAwarded Float
+  feedback      String?  @db.Text
+
+  attempt  QuizAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([attemptId, questionId])
+}
+
+// ───────────────────────────── Gamification ─────────────────────────────
+
+model Streak {
+  userId         String   @id
+  currentStreak  Int      @default(0)
+  longestStreak  Int      @default(0)
+  /// Local calendar day (YYYY-MM-DD, in the user's timezone) of the last study activity.
+  lastActiveDate String?
+  /// Earned freezes that silently cover a single missed day.
+  freezeTokens   Int      @default(0)
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// One row per user per local day — the "chain" of exercise completion quality.
+model StudyActivity {
+  id               String @id @default(cuid())
+  userId           String
+  date             String // YYYY-MM-DD (user timezone)
+  minutes          Int    @default(0)
+  quizzesCompleted Int    @default(0)
+  avgScore         Float?
+  /// Score adjusted for focus violations (0–100).
+  qualityScore     Float?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+}
+
+model LearningPlan {
+  id         String   @id @default(cuid())
+  userId     String
+  title      String
+  summary    String   @db.Text
+  weakTopics String[]
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  user  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items LearningPlanItem[]
+
+  @@index([userId, isActive])
+}
+
+model LearningPlanItem {
+  id             String         @id @default(cuid())
+  planId         String
+  order          Int
+  subject        String
+  topic          String
+  emoji          String         @default("📘")
+  description    String         @db.Text
+  estimatedHours Float
+  scheduledFor   DateTime
+  status         PlanItemStatus @default(PENDING)
+
+  plan LearningPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@index([planId, scheduledFor])
+}
+
+model Follow {
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("UserFollowing", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("UserFollowers", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@id([followerId, followingId])
+  @@index([followingId])
+}
